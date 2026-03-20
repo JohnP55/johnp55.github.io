@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>my websit :DDDDDDDD</title>
+</head>
+<body>
+	<h1>Super Paper Mario JP Crash Fix Mod</h1>
+	<p>Does what it says on the tin. If you're interested in how the bug works, scroll down for the write-up.</p>
+	<h2>Download</h2>
+	<p>If you're just here to download it, here you go.
+	<ul>
+		<li>
+			<a href="/spm-jp-crash-fix/SPM_JP_Crash_Fix.zip">v1.0 (Latest version | March 20th, 2026)</a>
+			<ul>
+				<li>Initial release.</li>
+			</ul>
+		</li>
+	</ul>
+	<h3>Old Versions</h3>
+	<ul>
+		<li>
+			None yet.
+			<ul>
+				<li>When new versions are released, their changes will be documented here.</li>
+			</ul>
+		</li>
+	</ul>
+	<h3>Credits</h3>
+	<ul>
+		<li>https://github.com/SeekyCt/spm-rel-loader</li>
+		<li>https://github.com/SeekyCt/spm-save-exploit</li>
+		<li>https://github.com/SeekyCt/spm-headers</li>
+	</ul>
+	<h2>How It Works</h2>
+	<p>When the game needs to load a file from the disc, such as map data, actor models/textures, etc., it calls a function named DVDMgrReadAsync. Intelligent Systems's implementation is very... questionable, as they seem to have programmed it to support reading files in multiple parts, but the game only ever uses it to load files in one go.
+	<h3>The Code</h3>
+	<p>Here's a screenshot of the relevant decompiled code:</p>
+	<img style="width:512px" src='assets/shoutout-seeky-for-fully-decompiling-and-bytematching-these-years-before-either-of-us-realized-it-was-the-cause-of-jp-crashes.png' alt='Decompilation of the code responsible for JP crashes' />
+	<p>As you can see in readAsync, the flow eventually reaches a function called DVDReadAsyncPrio. That function, which is part of the RVL SDK, is what calls lower-level SDK functions and is ultimately responsible for sending the file request to the DVD driver.</p>
+	<p>A basic description of what readAsync does is that it sets the callback in the DVD block, calls DVDReadAsyncPrio, and then sets the lengthRemaining, lengthRead, and dest parameters of the DVDEntry. What's a DVDEntry? Glad you asked! That's the struct made by Intelligent Systems to store the context for DVD requests like this, so that it can read a file in multiple parts. As you can see, it doesn't even pretend to care about the real length of the data it just read, it just subtracts the entire length of the file.</p>
+	<p>Here's the important bit: you see that "callback" parameter? That's a function, and it's passed to DVDReadAsyncPrio for the SDK to call once it's done reading the file from the disc. In this case, that function is _cb from the above screenshot. That call will happen from the DVD thread. We don't need to cover threading in detail, but what you need to know is that there's a timer that ticks down every clock cycle, and when it reaches 0, the CPU just stops everything it's doing, and jumps to RVL code that sets it up to go do something else. These are called <b>interrupts</b>, and for all intents and purposes, they can effectively occur at any point during code execution.</p>
+	<p>At some point, an interrupt will occur that will cause the CPU to execute code for the DVD thread, and that's when the file read command is actually processed.</p>
+	<h3>The Bug</h3>
+	<p>So if interrupts can happen at any point, what if one triggers <i>after</i> the DVDReadAsyncPrio call, but <i>before</i> the DVDEntry parameters are properly set? What if, during that DVD thread interrupt (maybe even if multiple <i>other</i> interrupts happened between the main thread and the DVD thread), the read finishes, and _cb is called?</p>
+	<p>The result is that, once in _cb (still in the DVD thread), entry->lengthRemaining will still be the whole length of the file, as the interrupt occured before the rest of readAsync properly set it. This triggers another read, but when the main thread executes again, it goes right back to after the DVDReadAsyncPrio call, and there, it sets the entry's parameters. This causes two separate threads to mess with the same entry's parameters while doing work with them. This results in the game crashing.</p>
+	<h3>Why Wii U VC crashes more often</h3>
+	<p>When playing SPM on a Wii, files are loaded from the disc. Disc loads are quite a lot slower than Wii U VC, which loads files from either the NAND flash or a USB. These loads being significantly faster than disc loads cause Wii U VC to finish file reads faster, and therefore, when that specific interrupt timing occurs and the DVD thread executes before the rest of readAsync properly sets the DVDEntry parameters, Wii U VC loads are more likely to have finished the load, call _cb, trigger another read, and you already know how this ends.
+	<h3>Why It Happens After Loading Zones, and Why Some Maps Crash More Often Than Others</h3>
+	<p>When you enter a room, the game waits until all cutscenes are over, and you have control of the player. Once that's the case, the game preloads files for adjacent maps, including <b>enemy models and textures</b>. Some enemies have a lot of tiny files for textures, with Croacus himself having <b>over 20</b> files, most of which are only <b>96 bytes</b>, all loaded by DVDMgrReadAsync. This means that when you enter the 5-4 painting room, <b>each one of those ~20 tiny Croacus files is a chance to get a bad interrupt timing, finish a load too quickly, and JP crash.</b></p>
+	<img style="width:512px" src="./assets/croacuscrash.png" alt="Some idiot crashing in the painting room in the middle of a run" />
+	<h3>The Solution</h3>
+	<p>The solution is simple, and in fact it's already provided to us by Intelligent Systems in the PAL and US2 versions. We know files are read all at once, so there is no need to verify the DVDEntry's lengthRemaining field in _cb to potentially trigger a 2nd read. We can simply call DVDReadAsyncPrio, and let the SDK handle the rest. Here's the decompiled code of Intelligent Systems's fixed version:</p>
+	<img style="width:512px" src="./assets/dvdmgr2.png" alt="The fixed version of the code" />
+	<p>As you can see, this still has some issues, such as the DVDEntry fields still being updated despite never being used, and lengthRemaining being decremented to 0 immediately after being set. Those are likely remains of the previous implementation, as they are never read, they do not actually serve a purpose here. Additionally, _cb doesn't even have a chance of triggering a 2nd read depending on the state of anything, since files are read all at once, under normal circumstances those 2nd reads would never happen anyway.</p>
+	<h3>Conclusion</h3>
+	<p>In conclusion, 6 programmers</p>
+	<p>-JohnP55</p>
+</body>
+</html>
